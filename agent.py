@@ -18,7 +18,16 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
-from tools import search_listings, suggest_outfit, create_fit_card
+import json
+import re
+
+from tools import (
+    search_listings,
+    suggest_outfit,
+    create_fit_card,
+    estimate_value,
+    _chat,
+)
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -38,11 +47,58 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "parsed": {},                # extracted description / size / max_price
         "search_results": [],        # list of matching listing dicts
         "selected_item": None,       # top result, passed into suggest_outfit
+        "value_estimate": None,      # string returned by estimate_value (stretch)
         "wardrobe": wardrobe,        # user's wardrobe dict
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
     }
+
+
+# ── query parsing ─────────────────────────────────────────────────────────────
+
+def _parse_query(query: str) -> dict:
+    """
+    Use the LLM to pull a search description, size, and max_price out of a
+    natural-language query, returned as a dict:
+        {"description": str, "size": str | None, "max_price": float | None}
+
+    If the LLM call fails or the response can't be parsed, fall back to using the
+    whole query as the description with no size/price filter — so a parse problem
+    degrades gracefully instead of breaking the run.
+    """
+    fallback = {"description": query, "size": None, "max_price": None}
+
+    prompt = (
+        "Extract search filters from this thrift-shopping request and return ONLY a "
+        "JSON object with exactly these keys: description (string of the item "
+        "keywords, no size/price words), size (string like \"M\" or \"8\", or null), "
+        "max_price (number, or null).\n\n"
+        f"Request: {query!r}\n\n"
+        "Return only the JSON, nothing else."
+    )
+
+    try:
+        raw = _chat(prompt, temperature=0.0)
+        match = re.search(r"\{.*\}", raw, re.DOTALL)  # tolerate stray prose/fences
+        if not match:
+            return fallback
+        data = json.loads(match.group(0))
+    except Exception:
+        return fallback
+
+    description = (data.get("description") or query).strip() or query
+
+    size = data.get("size")
+    size = str(size).strip() if size not in (None, "", "null") else None
+
+    max_price = data.get("max_price")
+    try:
+        max_price = float(max_price) if max_price not in (None, "", "null") else None
+    except (TypeError, ValueError):
+        max_price = None
+
+    return {"description": description, "size": size, "max_price": max_price}
 
 
 # ── planning loop ─────────────────────────────────────────────────────────────
@@ -92,9 +148,47 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: fresh session — the single source of truth for this interaction.
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: parse the natural-language query into search parameters.
+    session["parsed"] = _parse_query(query)
+    parsed = session["parsed"]
+
+    # Step 3: search. This is the branch point — an empty result stops the loop
+    # here, so suggest_outfit is never called with an empty item.
+    session["search_results"] = search_listings(
+        description=parsed["description"],
+        size=parsed["size"],
+        max_price=parsed["max_price"],
+    )
+    if not session["search_results"]:
+        size_part = f" in size {parsed['size']}" if parsed["size"] else ""
+        price_part = f" under ${parsed['max_price']:g}" if parsed["max_price"] else ""
+        session["error"] = (
+            f"No matches for \"{parsed['description']}\"{size_part}{price_part}. "
+            "Try loosening a filter — a higher price, a different size, or broader "
+            "keywords."
+        )
+        return session  # early return: downstream tools are skipped
+
+    # Step 4: select the item to use (top-ranked result).
+    session["selected_item"] = session["search_results"][0]
+
+    # Step 4b (stretch): quick price read. Informational — never branches.
+    session["value_estimate"] = estimate_value(session["selected_item"])
+
+    # Step 5: suggest an outfit, passing the found item + wardrobe through state.
+    session["outfit_suggestion"] = suggest_outfit(
+        session["selected_item"], session["wardrobe"]
+    )
+
+    # Step 6: turn the suggestion into a shareable fit card.
+    session["fit_card"] = create_fit_card(
+        session["outfit_suggestion"], session["selected_item"]
+    )
+
+    # Step 7: done — error stayed None, all output fields are populated.
     return session
 
 
